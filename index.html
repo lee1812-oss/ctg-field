@@ -2872,7 +2872,7 @@ const RELAY_CODE = "// 현장용 파일에는 서버 코드가 들어 있지 않
 /* ===== 통합근태관리 (옛 이름: 출퇴근기록부) — 공통 ===== */
 const APP = '통합근태관리';
 const APP_OLD_NAMES = ['출퇴근기록부'];
-const APP_VER = 'v019';
+const APP_VER = 'v021';
 const EDITION = 'kiosk'; // 'hq' 본사관리자 · 'store' 매장관리자 · 'kiosk' 매장단말 (같은 코드에서 3개 파일)
 const ED = { hq: '본사 관리자용', store: '현장 관리자용', kiosk: '현장용' }[EDITION];
 const isHQ = EDITION === 'hq', isStoreEd = EDITION === 'store', isKioskEd = EDITION === 'kiosk';
@@ -6317,7 +6317,14 @@ const Phone = (() => {
 
   /* ---------- 상태 ---------- */
   const S = { screen: 'M00', sub: '', store: null, emp: null, pin: '', other: null, lockUntil: 0, sess: null, off: 0, pop: null, timer: 0, clk: 0, loc: null, pend: 'in', busy: false, err: '' };
-  const call = (action, extra) => relayCall(url(), Object.assign({ action }, extra));
+  const call = (action, extra) => {
+    if (S.demo) { // v021 시연 모드: 서버를 부르지 않는다
+      if (action === 'phSession') return Promise.resolve(S.sess);
+      if (action === 'phMonth') return Promise.resolve({ ok: true, ym: extra && extra.ym, days: [] });
+      return Promise.reject(new Error('시연 모드에서는 사용할 수 없습니다'));
+    }
+    return relayCall(url(), Object.assign({ action }, extra));
+  };
   const ec = e => { const m = String((e && e.message) || e).match(/^([A-Z_]+):([\s\S]*)$/); return m ? [m[1], m[2]] : ['', String((e && e.message) || e)]; };
   const isNet = e => /연결할 수 없|시간 초과|서버 주소|서버 응답/.test(String((e && e.message) || e));
   /* 지점·직원 목록 캐시: 서버에서 하루 두 번(한국 시각 00시·12시)만 새로 받고, 그 사이에는 마지막으로 받은 값을 그대로 쓴다.
@@ -6384,7 +6391,7 @@ const Phone = (() => {
     if (screen === 'MAIN' && S.screen !== 'MAIN') S.pop = null;
     S.screen = screen; S.sub = sub || ''; render(); window.scrollTo({ top: 0 });
   }
-  function resetLogin(msg) { me.token = ''; saveMe(); S.sess = null; S.emp = null; S.pin = ''; S.store = null; S.pop = null; go('M0S'); if (msg) toast(msg); }
+  function resetLogin(msg) { S.demo = false; try { localStorage.removeItem('ctgHomeCache_v1'); } catch (e) {} me.token = ''; saveMe(); S.sess = null; S.emp = null; S.pin = ''; S.store = null; S.pop = null; go('M0S'); if (msg) toast(msg); }
 
   /* ---------- PIN 입력 ---------- */
   const pinField = () => `<label class="inp pin4"><span class="pdots" aria-hidden="true"><i></i><i></i><i></i><i></i></span><input id="pin" type="password" inputmode="numeric" maxlength="4" autocomplete="off" aria-label="${T('PIN 입력')}"></label><div class="perr" id="perr"></div>`;
@@ -6453,13 +6460,15 @@ const Phone = (() => {
     modal: `<h3>${T('개인 PIN 번호 입력')}</h3><div class="mwho">${h(S.emp.name)}<span>${h(S.emp.pos)}</span></div>${pinField()}
       <button class="btn p" id="pinGo">${T('로그인')}</button><div class="lrow"><button class="lnk" data-fg>${T('PIN 잊었어요')}</button><button class="lnk" id="other">${T('다른 이름 선택')}</button></div>`,
     bind() {
+      warm();
       q$('#other').onclick = () => go('M01');
       mountPin(async pin => {
         try {
           const base = { store: S.store.id, uid: S.emp.uid, pin, dev: me.dev, sig: devSig() };
           const r = await call('phLogin', base);
           S.pin = pin;
-          if (r.next === 'ok') { me.token = r.token; saveMe(); S.pin = ''; if (r.relinked) toast(T('이 휴대폰으로 다시 연결했습니다')); if (!keepOk()) toast(T('이 화면에서는 로그인 정보가 저장되지 않습니다. Safari에서 직접 열어 주세요.')); return enterMain(); }
+          if (r.next === 'demo' && r.sess) { S.pin = ''; S.demo = true; S.err = ''; applySess(r.sess); return go('MAIN'); }
+          if (r.next === 'ok') { me.token = r.token; saveMe(); S.pin = ''; if (r.relinked) toast(T('이 휴대폰으로 다시 연결했습니다')); if (!keepOk()) toast(T('이 화면에서는 로그인 정보가 저장되지 않습니다. Safari에서 직접 열어 주세요.')); if (r.sess && r.sess.time) { S.err = ''; applySess(r.sess); return go('MAIN'); } return enterMain(); }
           if (r.next === 'register') return go('M03', 'confirm');
           S.other = r.req; return go('M04');
         } catch (e) {
@@ -6575,9 +6584,17 @@ const Phone = (() => {
   const GPSFAIL = { far: ['지점에서 멀리 있습니다', '지점 안에서 다시 눌러 주세요.'], weak: ['위치 정확도가 낮습니다', '잠시 뒤 다시 눌러 주세요.'], denied: ['위치 권한이 필요합니다', '휴대폰 설정에서 위치를 허용해 주세요.'] };
   const distM = (a1, o1, a2, o2) => { const R = 6371000, t = Math.PI / 180, da = (a2 - a1) * t, dO = (o2 - o1) * t; const x = Math.sin(da / 2) ** 2 + Math.cos(a1 * t) * Math.cos(a2 * t) * Math.sin(dO / 2) ** 2; return 2 * R * Math.asin(Math.sqrt(x)); };
 
+  const HK = 'ctgHomeCache_v1';
+  const dayNow = () => new Date(Date.now() + 4 * 3600000).toISOString().slice(0, 10);
+  function homeSave(r) { if (S.demo) return; try { localStorage.setItem(HK, JSON.stringify({ t: me.token, d: r.day, s: r })); } catch (e) {} }
+  function homeLoad() { try { const c = JSON.parse(localStorage.getItem(HK) || 'null'); if (c && me.token && c.t === me.token && c.s && c.d === dayNow()) return c.s; } catch (e) {} return null; }
+  function homeClear() { try { localStorage.removeItem(HK); } catch (e) {} }
+  function applySess(r) { S.sess = r; S.off = r.time - Date.now(); homeSave(r); return r; }
+  let warmAt = 0;
+  function warm() { if (Date.now() - warmAt < 60000) return; warmAt = Date.now(); try { call('ping').catch(() => {}); } catch (e) {} }
   async function loadSession() {
     const r = await call('phSession', { token: me.token });
-    S.sess = r; S.off = r.time - Date.now(); return r;
+    return applySess(r);
   }
   async function enterMain() {
     S.sess = null; S.err = ''; go('MAIN');
@@ -6677,6 +6694,7 @@ const Phone = (() => {
   async function press(type) {
     S.pop = { busy: true, txt: T('위치 확인 중') }; render();
     const g = S.sess.geo; S.loc = null;
+    if (S.demo) { await new Promise(r => setTimeout(r, 800)); S.pop = null; S.pend = type; return go('M10'); }
     if (g && g.req) {
       const loc = await getLoc();
       if (loc.err) { S.pop = { msg: GPSFAIL[loc.err] }; return render(); }
@@ -6691,8 +6709,9 @@ const Phone = (() => {
     const pop = S.pop;
     const modal = !pop ? '' : pop.busy ? `<span class="spin lg"></span><h3>${pop.txt}</h3>` : `<h3>${T(pop.msg[0])}</h3><p class="msg" style="margin-top:8px">${T(pop.msg[1])}</p><button class="btn" id="pk">${T('확인')}</button>`;
     return { title: T('QR 스캔'), back: () => { S.pop = null; go('MAIN'); }, modal,
-      html: `<div class="vf"><i></i><i></i><i></i><i></i><div id="camReader" class="camr"></div></div><p class="center p" style="margin-top:18px">${T('QR 코드를 비춰주세요')}</p>`,
+      html: `<div class="vf"><i></i><i></i><i></i><i></i><div id="camReader" class="camr"></div></div><p class="center p" style="margin-top:18px">${T('QR 코드를 비춰주세요')}</p>${S.demo ? `<div class="center"><button class="btn" id="demoSkip" style="margin-top:14px">${T('시연: QR 건너뛰기')}</button></div>` : ''}`,
       bind() {
+        const ds = q$('#demoSkip'); if (ds) ds.onclick = () => demoPunch();
         const pk = q$('#pk'); if (pk) pk.onclick = () => { const bad = S.pop && S.pop.back; S.pop = null; if (bad === 'reset') return resetLogin(authMsg('AUTH_DEV')); if (bad === 'main') return go('MAIN'); render(); };
         if (!pop) startCam();
       } };
@@ -6704,10 +6723,17 @@ const Phone = (() => {
       stopCam();
       const cam = new Html5Qrcode('camReader', { formatsToSupport: [Html5QrcodeSupportedFormats.QR_CODE], verbose: false }); Phone._cam = cam;
       await cam.start({ facingMode: 'environment' }, { fps: 10, qrbox: s => { const m = Math.floor(Math.min(s.width, s.height) * 0.72); return { width: m, height: m }; } }, txt => onScan(txt), () => {});
-    } catch (e) { Phone._cam = null; if (S.screen === 'M10') { S.pop = { msg: CAMFAIL, back: 'main' }; render(); } }
+    } catch (e) { Phone._cam = null; if (S.demo) return; if (S.screen === 'M10') { S.pop = { msg: CAMFAIL, back: 'main' }; render(); } }
   }
   let scanning = false;
+  function demoPunch() {
+    if (!S.demo || S.screen !== 'M10') return; stopCam();
+    const ts = Date.now() + (S.off || 0), type = S.pend;
+    if (type === 'in') { S.sess.in = ts; S.sess.out = null; } else S.sess.out = ts;
+    go('MAIN'); S.pop = { ok: true, type, time: hhmm(ts) }; render();
+  }
   async function onScan(txt) {
+    if (S.demo) return demoPunch();
     if (scanning || S.screen !== 'M10') return; scanning = true;
     stopCam(); S.pop = { busy: true, txt: T('서버에서 확인 중') }; render();
     try {
@@ -6770,9 +6796,18 @@ const Phone = (() => {
   async function start() {
     applyStyle(); go('M00');
     const t0 = Date.now(); let sessErr = null;
-    if (me.token) { try { await loadSession(); } catch (e) { sessErr = e; } }
+    const cached = homeLoad(); let bg = null;
+    if (me.token) {
+      if (cached) bg = loadSession().then(() => null, e => e);
+      else { try { await loadSession(); } catch (e) { sessErr = e; } }
+    } else warm();
     const wait = 1000 - (Date.now() - t0); if (wait > 0) await new Promise(r => setTimeout(r, wait));
     if (!me.token) return go('M0S');
+    if (cached && bg) {
+      if (!S.sess) S.sess = cached;
+      go('MAIN');
+      bg.then(e => { if (!e) { if (S.screen === 'MAIN' && !S.pop) render(); return; } const [c] = ec(e); if (c === 'AUTH_DEV' || c === 'AUTH_GONE') return sessFail(e); });
+    } else
     if (sessErr) { const [c] = ec(sessErr); if (c === 'AUTH_DEV' || c === 'AUTH_GONE') return resetLogin(authMsg(c)); S.err = isNet(sessErr) ? T('연결할 수 없습니다. 인터넷 연결을 확인해 주세요.') : ec(sessErr)[1]; }
     go('MAIN');
     document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && S.screen === 'MAIN' && me.token && !S.pop) loadSession().then(() => { if (S.screen === 'MAIN' && !S.pop) render(); }).catch(e => { const [c] = ec(e); if (c === 'AUTH_DEV' || c === 'AUTH_GONE') sessFail(e); }); });
